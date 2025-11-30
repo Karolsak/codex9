@@ -98,6 +98,53 @@ class ShuntMotorCase:
         }
 
 
+class SeparatelyExcitedDCMotor:
+    """Simple model for separately excited DC motor used in lab module."""
+
+    def __init__(self, torque_constant, armature_resistance, armature_inductance,
+                 inertia, damping, supply_voltage):
+        self.K = torque_constant  # Nm/A and V/(rad/s)
+        self.Ra = armature_resistance
+        self.La = armature_inductance
+        self.J = inertia
+        self.B = damping
+        self.V = supply_voltage
+
+    def compute_torque(self, current):
+        return self.K * current
+
+    def compute_speed_from_back_emf(self, back_emf):
+        omega = back_emf / self.K
+        return omega * 60 / (2 * math.pi)
+
+    def dynamics(self, t, state, load_torque):
+        ia, omega = state
+        dia_dt = (self.V - self.Ra * ia - self.K * omega) / self.La
+        domega_dt = (self.K * ia - load_torque - self.B * omega) / self.J
+        return [dia_dt, domega_dt]
+
+    def simulate(self, duration, load_torque, solver='RK45'):
+        sol = solve_ivp(
+            lambda t, y: self.dynamics(t, y, load_torque),
+            (0, duration), [0.0, 0.0], method=solver, max_step=0.005,
+            dense_output=True
+        )
+
+        t_eval = np.linspace(0, duration, 400)
+        y = sol.sol(t_eval)
+        ia = y[0, :]
+        omega = y[1, :]
+        torque = self.compute_torque(ia)
+        speed_rpm = omega * 60 / (2 * math.pi)
+
+        return {
+            't': t_eval,
+            'current': ia,
+            'speed_rpm': speed_rpm,
+            'torque': torque
+        }
+
+
 class InductionMotorModel:
     """Mathematical model for 3-phase squirrel cage induction motor"""
 
@@ -309,6 +356,8 @@ class MotorAnalysisTool:
         self.simulation_data = None
         self.motor = None
         self.shunt_case = ShuntMotorCase()
+        self.dc_motor = None
+        self.dc_sim_data = None
 
         # Configure grid weight for auto-scaling
         self.root.grid_rowconfigure(0, weight=1)
@@ -517,20 +566,41 @@ class MotorAnalysisTool:
         # Electrical results tab
         electrical_tab = ttk.Frame(self.results_notebook)
         self.results_notebook.add(electrical_tab, text="Electrical")
-        self.results_text = tk.Text(electrical_tab, height=8, width=80, font=("Courier", 10))
-        self.results_text.pack(fill=tk.BOTH, expand=True)
+        elec_frame = ttk.Frame(electrical_tab)
+        elec_frame.pack(fill=tk.BOTH, expand=True)
+        elec_scroll = ttk.Scrollbar(elec_frame, orient=tk.VERTICAL)
+        self.results_text = tk.Text(elec_frame, height=8, width=80, font=("Courier", 10),
+                                    yscrollcommand=elec_scroll.set)
+        elec_scroll.config(command=self.results_text.yview)
+        self.results_text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        elec_scroll.pack(side=tk.RIGHT, fill=tk.Y)
 
         # Economic analysis tab
         economic_tab = ttk.Frame(self.results_notebook)
         self.results_notebook.add(economic_tab, text="Economic / Losses")
-        self.economic_text = tk.Text(economic_tab, height=8, width=80, font=("Courier", 10))
-        self.economic_text.pack(fill=tk.BOTH, expand=True)
+        econ_frame = ttk.Frame(economic_tab)
+        econ_frame.pack(fill=tk.BOTH, expand=True)
+        econ_scroll = ttk.Scrollbar(econ_frame, orient=tk.VERTICAL)
+        self.economic_text = tk.Text(econ_frame, height=8, width=80, font=("Courier", 10),
+                                     yscrollcommand=econ_scroll.set)
+        econ_scroll.config(command=self.economic_text.yview)
+        self.economic_text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        econ_scroll.pack(side=tk.RIGHT, fill=tk.Y)
 
         # Multi-physics tab
         multiphysics_tab = ttk.Frame(self.results_notebook)
         self.results_notebook.add(multiphysics_tab, text="Multi-Physics")
-        self.multiphysics_text = tk.Text(multiphysics_tab, height=8, width=80, font=("Courier", 10))
-        self.multiphysics_text.pack(fill=tk.BOTH, expand=True)
+        multi_frame = ttk.Frame(multiphysics_tab)
+        multi_frame.pack(fill=tk.BOTH, expand=True)
+        multi_scroll = ttk.Scrollbar(multi_frame, orient=tk.VERTICAL)
+        self.multiphysics_text = tk.Text(multi_frame, height=8, width=80, font=("Courier", 10),
+                                         yscrollcommand=multi_scroll.set)
+        multi_scroll.config(command=self.multiphysics_text.yview)
+        self.multiphysics_text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        multi_scroll.pack(side=tk.RIGHT, fill=tk.Y)
+
+        # DC motor lab tab for separately excited machine
+        self.create_dc_lab_tab()
 
     def create_shunt_motor_panel(self):
         """Panel dedicated to DC shunt motor case study and economic analysis."""
@@ -566,6 +636,75 @@ class MotorAnalysisTool:
 
         panel.grid_columnconfigure(1, weight=1)
         panel.grid_columnconfigure(3, weight=1)
+
+    def create_dc_lab_tab(self):
+        """Create advanced lab tab for separately excited DC motor analysis."""
+        dc_tab = ttk.Frame(self.results_notebook)
+        self.results_notebook.add(dc_tab, text="DC Motor Lab / Advanced")
+
+        # Input area
+        input_frame = ttk.LabelFrame(dc_tab, text="Lab Inputs", padding="8")
+        input_frame.grid(row=0, column=0, sticky=(tk.W, tk.E))
+
+        labels = [
+            ("Base Torque (N·m):", "base_torque", 700.0),
+            ("Base Armature Current (A):", "base_current", 35.0),
+            ("Target Armature Current (A):", "target_current", 70.0),
+            ("Back EMF at Base (V):", "back_emf", 200.0),
+            ("Supply Voltage (V):", "dc_voltage", 220.0),
+            ("Armature Resistance (Ω):", "dc_ra", 0.25),
+            ("Armature Inductance (H):", "dc_la", 0.08),
+            ("Rotor Inertia (kg·m²):", "dc_j", 1.2),
+            ("Viscous Damping (N·m·s):", "dc_b", 0.15),
+            ("Load Torque (N·m):", "dc_load", 150.0),
+            ("Simulation Time (s):", "dc_time", 3.0),
+        ]
+
+        self.dc_vars = {}
+        for idx, (label, key, default) in enumerate(labels):
+            ttk.Label(input_frame, text=label).grid(row=idx//2, column=(idx % 2)*2, sticky=tk.W, padx=4, pady=2)
+            var = tk.DoubleVar(value=default)
+            ttk.Entry(input_frame, textvariable=var, width=12).grid(row=idx//2, column=(idx % 2)*2 + 1, sticky=(tk.W, tk.E), padx=4, pady=2)
+            self.dc_vars[key] = var
+
+        # Solver selection
+        ttk.Label(input_frame, text="ODE Solver:").grid(row=6, column=0, sticky=tk.W, padx=4, pady=2)
+        self.dc_solver = tk.StringVar(value="RK45")
+        ttk.Combobox(input_frame, textvariable=self.dc_solver, values=["RK45", "RK23", "Euler"], state="readonly", width=10).grid(row=6, column=1, sticky=(tk.W, tk.E), padx=4, pady=2)
+
+        # Control buttons
+        btn_frame = ttk.Frame(dc_tab)
+        btn_frame.grid(row=1, column=0, sticky=(tk.W, tk.E), pady=6)
+        ttk.Button(btn_frame, text="Start DC Analysis", command=self.run_dc_analysis).pack(side=tk.LEFT, padx=4)
+        ttk.Button(btn_frame, text="Run Dynamic Lab", command=self.simulate_dc_dynamics).pack(side=tk.LEFT, padx=4)
+        ttk.Button(btn_frame, text="Reset", command=self.reset_dc_lab).pack(side=tk.LEFT, padx=4)
+
+        # Results and visualization
+        dc_results_frame = ttk.Frame(dc_tab)
+        dc_results_frame.grid(row=2, column=0, sticky=(tk.W, tk.E), padx=4, pady=4)
+        dc_scroll = ttk.Scrollbar(dc_results_frame, orient=tk.VERTICAL)
+        self.dc_results_text = tk.Text(dc_results_frame, height=10, width=90, font=("Courier", 10),
+                                       yscrollcommand=dc_scroll.set)
+        dc_scroll.config(command=self.dc_results_text.yview)
+        self.dc_results_text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        dc_scroll.pack(side=tk.RIGHT, fill=tk.Y)
+
+        plot_frame = ttk.LabelFrame(dc_tab, text="Dynamic Visualization", padding="6")
+        plot_frame.grid(row=3, column=0, sticky=(tk.W, tk.E, tk.N, tk.S), padx=4, pady=4)
+        plot_frame.grid_columnconfigure(0, weight=1)
+        plot_frame.grid_rowconfigure(0, weight=1)
+
+        self.dc_fig = Figure(figsize=(6, 4), dpi=100)
+        self.dc_ax_speed = self.dc_fig.add_subplot(2, 1, 1)
+        self.dc_ax_current = self.dc_fig.add_subplot(2, 1, 2)
+        self.dc_fig.tight_layout(pad=2.0)
+
+        self.dc_canvas = FigureCanvasTkAgg(self.dc_fig, master=plot_frame)
+        self.dc_canvas.draw()
+        self.dc_canvas.get_tk_widget().grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
+
+        dc_tab.grid_columnconfigure(0, weight=1)
+        dc_tab.grid_rowconfigure(3, weight=1)
 
     def init_plots(self):
         """Initialize empty plots"""
@@ -962,6 +1101,142 @@ Rated Speed:             {self.shunt_case.speed_rpm:.1f} rpm
         except Exception as exc:
             messagebox.showwarning("Economic Analysis", f"Unable to update economics: {exc}")
 
+    def run_dc_analysis(self):
+        """Solve the separately excited DC motor problem analytically."""
+        try:
+            base_torque = self.dc_vars['base_torque'].get()
+            base_current = self.dc_vars['base_current'].get()
+            target_current = self.dc_vars['target_current'].get()
+            back_emf = self.dc_vars['back_emf'].get()
+            voltage = self.dc_vars['dc_voltage'].get()
+            ra = self.dc_vars['dc_ra'].get()
+            la = self.dc_vars['dc_la'].get()
+            inertia = self.dc_vars['dc_j'].get()
+            damping = self.dc_vars['dc_b'].get()
+
+            if base_current <= 0:
+                raise ValueError("Base current must be positive for constant derivation.")
+
+            torque_constant = base_torque / base_current
+            self.dc_motor = SeparatelyExcitedDCMotor(
+                torque_constant, ra, la, inertia, damping, voltage
+            )
+
+            target_torque = self.dc_motor.compute_torque(target_current)
+            est_speed_rpm = self.dc_motor.compute_speed_from_back_emf(back_emf)
+
+            summary = f"""
+{'='*80}
+SEPARATELY EXCITED DC MOTOR LAB
+{'='*80}
+Given:
+  Base Torque:          {base_torque:.2f} N·m
+  Base Armature Current:{base_current:.2f} A
+  Back EMF at Base:     {back_emf:.2f} V
+
+Results:
+  Torque Constant (K):  {torque_constant:.2f} N·m/A
+  (a) Torque at {target_current:.1f} A: {target_torque:.2f} N·m
+  (b) Speed from {back_emf:.1f} V back EMF: {est_speed_rpm:.2f} rpm
+
+Dynamic Model (ready for simulation):
+  Electrical:   L di/dt = V - R_a i - K ω
+  Mechanical:   J dω/dt = K i - B ω - T_load
+  Supply:       {voltage:.1f} V, R_a={ra:.3f} Ω, L_a={la:.3f} H, J={inertia:.3f} kg·m², B={damping:.3f} N·m·s
+{'='*80}
+"""
+
+            self.dc_results_text.delete(1.0, tk.END)
+            self.dc_results_text.insert(1.0, summary)
+            self.results_notebook.select(self.results_notebook.tabs()[-1])
+        except Exception as exc:
+            messagebox.showerror("DC Analysis Error", f"Unable to solve DC motor case:\n{exc}")
+
+    def euler_dc_solver(self, motor, duration, load_torque):
+        dt = 0.001 if duration <= 1 else 0.002
+        t = np.arange(0, duration + dt, dt)
+        ia = np.zeros_like(t)
+        omega = np.zeros_like(t)
+
+        for i in range(1, len(t)):
+            dia_dt, domega_dt = motor.dynamics(t[i-1], [ia[i-1], omega[i-1]], load_torque)
+            ia[i] = ia[i-1] + dia_dt * dt
+            omega[i] = omega[i-1] + domega_dt * dt
+
+        torque = motor.compute_torque(ia)
+        speed_rpm = omega * 60 / (2 * math.pi)
+
+        return {
+            't': t,
+            'current': ia,
+            'speed_rpm': speed_rpm,
+            'torque': torque
+        }
+
+    def simulate_dc_dynamics(self):
+        """Run dynamic simulation for the DC motor lab with chosen solver."""
+        try:
+            if self.dc_motor is None:
+                self.run_dc_analysis()
+
+            load_torque = self.dc_vars['dc_load'].get()
+            duration = self.dc_vars['dc_time'].get()
+            solver = self.dc_solver.get()
+
+            if solver == 'Euler':
+                self.dc_sim_data = self.euler_dc_solver(self.dc_motor, duration, load_torque)
+            else:
+                self.dc_sim_data = self.dc_motor.simulate(duration, load_torque, solver=solver)
+
+            self.update_dc_plots()
+
+            if self.dc_results_text.get(1.0, tk.END).strip():
+                self.dc_results_text.insert(tk.END, "\nDynamic run completed. Check plots for speed/current evolution.\n")
+            else:
+                self.dc_results_text.insert(1.0, "Dynamic run completed. Check plots for speed/current evolution.\n")
+        except Exception as exc:
+            messagebox.showerror("DC Simulation Error", f"Unable to run DC simulation:\n{exc}")
+
+    def update_dc_plots(self):
+        if self.dc_sim_data is None:
+            return
+
+        t = self.dc_sim_data['t']
+        speed = self.dc_sim_data['speed_rpm']
+        current = self.dc_sim_data['current']
+        torque = self.dc_sim_data['torque']
+
+        self.dc_ax_speed.clear()
+        self.dc_ax_current.clear()
+
+        self.dc_ax_speed.plot(t, speed, label='Speed (rpm)', color='navy', linewidth=2)
+        self.dc_ax_speed.plot(t, torque, label='Electromagnetic Torque (N·m)', color='teal', linestyle='--')
+        self.dc_ax_speed.set_xlabel('Time (s)')
+        self.dc_ax_speed.set_ylabel('Speed / Torque')
+        self.dc_ax_speed.set_title('DC Motor Speed & Torque Response')
+        self.dc_ax_speed.grid(True, alpha=0.3)
+        self.dc_ax_speed.legend(loc='best')
+
+        self.dc_ax_current.plot(t, current, label='Armature Current (A)', color='darkred', linewidth=2)
+        self.dc_ax_current.set_xlabel('Time (s)')
+        self.dc_ax_current.set_ylabel('Current (A)')
+        self.dc_ax_current.set_title('Armature Current Response')
+        self.dc_ax_current.grid(True, alpha=0.3)
+        self.dc_ax_current.legend(loc='best')
+
+        self.dc_fig.tight_layout()
+        self.dc_canvas.draw()
+
+    def reset_dc_lab(self):
+        """Clear lab results and plots."""
+        self.dc_sim_data = None
+        self.dc_results_text.delete(1.0, tk.END)
+        self.dc_ax_speed.clear()
+        self.dc_ax_current.clear()
+        self.dc_ax_speed.set_title('DC Motor Speed & Torque Response')
+        self.dc_ax_current.set_title('Armature Current Response')
+        self.dc_canvas.draw()
+
     def plot_simulation_results(self):
         """Plot simulation results"""
         if self.simulation_data is None:
@@ -1097,6 +1372,9 @@ in electrical engineering applications.
             try:
                 self.fig.tight_layout()
                 self.canvas.draw()
+                if hasattr(self, 'dc_fig'):
+                    self.dc_fig.tight_layout()
+                    self.dc_canvas.draw()
             except:
                 pass  # Ignore errors during resize
 

@@ -17,6 +17,87 @@ from scipy.integrate import solve_ivp
 import math
 
 
+class ShuntMotorCase:
+    """Utility class to evaluate DC shunt motor scenarios."""
+
+    def __init__(self, voltage=230.0, line_current=40.0, speed_rpm=1100.0,
+                 output_power_hp=10.8, core_loss=200.0, friction_loss=180.0,
+                 brush_loss=37.0, stray_loss=37.0, armature_resistance=0.25,
+                 field_resistance=230.0):
+        self.voltage = voltage
+        self.line_current = line_current
+        self.speed_rpm = speed_rpm
+        self.output_power_hp = output_power_hp
+        self.core_loss = core_loss
+        self.friction_loss = friction_loss
+        self.brush_loss = brush_loss
+        self.stray_loss = stray_loss
+        self.armature_resistance = armature_resistance
+        self.field_resistance = field_resistance
+
+    @property
+    def field_current(self):
+        return self.voltage / self.field_resistance
+
+    def _armature_current(self, line_current=None):
+        if line_current is None:
+            line_current = self.line_current
+        return line_current - self.field_current
+
+    def _armature_copper_loss(self, armature_current):
+        return (armature_current ** 2) * self.armature_resistance
+
+    def _constant_losses(self):
+        return self.field_current ** 2 * self.field_resistance + self.core_loss + self.friction_loss + self.brush_loss + self.stray_loss
+
+    def evaluate(self, output_power_watts=None):
+        """Return efficiency and electrical operating point.
+
+        Args:
+            output_power_watts: Optional mechanical output power. If omitted, use rated case.
+        """
+        if output_power_watts is None:
+            output_power_watts = self.output_power_hp * 746
+
+        constant_losses = self._constant_losses()
+
+        # Solve for armature current that satisfies power balance when output is specified
+        # Input power: V * (Ia + If)
+        # Output power: specified
+        # Losses: constant_losses + Ia^2 * Ra
+        # => V * (Ia + If) = output + constant_losses + Ia^2 * Ra
+        a = self.armature_resistance
+        b = -self.voltage
+        c = (output_power_watts + constant_losses) - self.voltage * self.field_current
+
+        discriminant = b ** 2 - 4 * a * c
+        if discriminant < 0:
+            raise ValueError("Invalid operating point: negative discriminant")
+
+        ia_candidate_1 = (-b + math.sqrt(discriminant)) / (2 * a)
+        ia_candidate_2 = (-b - math.sqrt(discriminant)) / (2 * a)
+        ia = ia_candidate_1 if ia_candidate_1 > 0 else ia_candidate_2
+
+        pin = self.voltage * (ia + self.field_current)
+        total_losses = constant_losses + self._armature_copper_loss(ia)
+        efficiency = output_power_watts / pin
+        back_emf = self.voltage - ia * self.armature_resistance
+
+        # Base back emf for speed scaling (rated case)
+        ia_rated = self._armature_current()
+        e_rated = self.voltage - ia_rated * self.armature_resistance
+        speed_rpm = self.speed_rpm * back_emf / e_rated
+
+        return {
+            "armature_current": ia,
+            "input_power": pin,
+            "losses": total_losses,
+            "efficiency": efficiency,
+            "speed_rpm": speed_rpm,
+            "back_emf": back_emf
+        }
+
+
 class InductionMotorModel:
     """Mathematical model for 3-phase squirrel cage induction motor"""
 
@@ -227,6 +308,7 @@ class MotorAnalysisTool:
         self.simulation_running = False
         self.simulation_data = None
         self.motor = None
+        self.shunt_case = ShuntMotorCase()
 
         # Configure grid weight for auto-scaling
         self.root.grid_rowconfigure(0, weight=1)
@@ -246,6 +328,7 @@ class MotorAnalysisTool:
         self.create_control_panel()
         self.create_visualization_panel()
         self.create_results_panel()
+        self.create_shunt_motor_panel()
 
         # Bind window resize event
         self.root.bind('<Configure>', self.on_window_resize)
@@ -360,6 +443,37 @@ class MotorAnalysisTool:
                                      command=self.reset_simulation)
         self.reset_btn.pack(side=tk.LEFT, padx=5, expand=True, fill=tk.X)
 
+        # Advanced control options
+        advanced_frame = ttk.LabelFrame(control_frame, text="Advanced Controls",
+                                        padding="8")
+        advanced_frame.grid(row=4, column=0, columnspan=3, sticky=(tk.W, tk.E), pady=5)
+
+        ttk.Label(advanced_frame, text="Control Strategy:").grid(row=0, column=0, sticky=tk.W)
+        self.control_strategy = tk.StringVar(value="Vector")
+        strategy_combo = ttk.Combobox(advanced_frame, textvariable=self.control_strategy,
+                                      values=["V/f", "Vector", "DTC", "FOC"], width=12,
+                                      state="readonly")
+        strategy_combo.grid(row=0, column=1, padx=4, pady=2, sticky=(tk.W, tk.E))
+
+        ttk.Label(advanced_frame, text="Field Weakening (%):").grid(row=1, column=0, sticky=tk.W)
+        self.field_weakening = tk.DoubleVar(value=0.0)
+        ttk.Scale(advanced_frame, from_=0, to=30, variable=self.field_weakening,
+                  orient=tk.HORIZONTAL).grid(row=1, column=1, padx=4, pady=2, sticky=(tk.W, tk.E))
+
+        ttk.Label(advanced_frame, text="Thermal Limit (°C):").grid(row=2, column=0, sticky=tk.W)
+        self.thermal_limit = tk.DoubleVar(value=110.0)
+        ttk.Scale(advanced_frame, from_=60, to=150, variable=self.thermal_limit,
+                  orient=tk.HORIZONTAL).grid(row=2, column=1, padx=4, pady=2, sticky=(tk.W, tk.E))
+
+        ttk.Label(advanced_frame, text="Derating (%):").grid(row=3, column=0, sticky=tk.W)
+        self.derating = tk.DoubleVar(value=0.0)
+        ttk.Scale(advanced_frame, from_=0, to=40, variable=self.derating,
+                  orient=tk.HORIZONTAL).grid(row=3, column=1, padx=4, pady=2, sticky=(tk.W, tk.E))
+
+        self.power_consumption_var = tk.StringVar(value="Power Consumption: N/A")
+        ttk.Label(advanced_frame, textvariable=self.power_consumption_var,
+                  foreground="blue").grid(row=4, column=0, columnspan=2, sticky=tk.W, pady=2)
+
         # Configure column weights
         control_frame.grid_columnconfigure(1, weight=1)
         control_frame.grid_rowconfigure(4, weight=1)
@@ -374,10 +488,11 @@ class MotorAnalysisTool:
         # Create matplotlib figure
         self.fig = Figure(figsize=(10, 8), dpi=100)
 
-        # Create subplots
-        self.ax1 = self.fig.add_subplot(3, 1, 1)
-        self.ax2 = self.fig.add_subplot(3, 1, 2)
-        self.ax3 = self.fig.add_subplot(3, 1, 3)
+        # Create subplots (2x2 grid for multi-physics visualization)
+        self.ax1 = self.fig.add_subplot(2, 2, 1)
+        self.ax2 = self.fig.add_subplot(2, 2, 2)
+        self.ax3 = self.fig.add_subplot(2, 2, 3)
+        self.ax4 = self.fig.add_subplot(2, 2, 4)
 
         self.fig.tight_layout(pad=3.0)
 
@@ -390,22 +505,67 @@ class MotorAnalysisTool:
         self.init_plots()
 
     def create_results_panel(self):
-        """Create results display panel"""
+        """Create results display panel with tabs"""
         results_frame = ttk.LabelFrame(self.main_container, text="Calculation Results",
                                         padding="10")
         results_frame.grid(row=2, column=0, columnspan=2, padx=5, pady=5,
-                           sticky=(tk.W, tk.E))
+                           sticky=(tk.W, tk.E, tk.N, tk.S))
 
-        # Results text widget
-        self.results_text = tk.Text(results_frame, height=8, width=80,
-                                     font=("Courier", 10))
+        self.results_notebook = ttk.Notebook(results_frame)
+        self.results_notebook.pack(fill=tk.BOTH, expand=True)
+
+        # Electrical results tab
+        electrical_tab = ttk.Frame(self.results_notebook)
+        self.results_notebook.add(electrical_tab, text="Electrical")
+        self.results_text = tk.Text(electrical_tab, height=8, width=80, font=("Courier", 10))
         self.results_text.pack(fill=tk.BOTH, expand=True)
 
-        # Scrollbar
-        scrollbar = ttk.Scrollbar(results_frame, orient=tk.VERTICAL,
-                                   command=self.results_text.yview)
-        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
-        self.results_text.config(yscrollcommand=scrollbar.set)
+        # Economic analysis tab
+        economic_tab = ttk.Frame(self.results_notebook)
+        self.results_notebook.add(economic_tab, text="Economic / Losses")
+        self.economic_text = tk.Text(economic_tab, height=8, width=80, font=("Courier", 10))
+        self.economic_text.pack(fill=tk.BOTH, expand=True)
+
+        # Multi-physics tab
+        multiphysics_tab = ttk.Frame(self.results_notebook)
+        self.results_notebook.add(multiphysics_tab, text="Multi-Physics")
+        self.multiphysics_text = tk.Text(multiphysics_tab, height=8, width=80, font=("Courier", 10))
+        self.multiphysics_text.pack(fill=tk.BOTH, expand=True)
+
+    def create_shunt_motor_panel(self):
+        """Panel dedicated to DC shunt motor case study and economic analysis."""
+        panel = ttk.LabelFrame(self.main_container, text="DC Shunt Motor Study & Economics", padding="10")
+        panel.grid(row=3, column=0, columnspan=2, padx=5, pady=5, sticky=(tk.W, tk.E))
+
+        ttk.Label(panel, text="Output Reduction (%):").grid(row=0, column=0, sticky=tk.W)
+        self.output_reduction = tk.DoubleVar(value=50.0)
+        ttk.Scale(panel, from_=0, to=80, variable=self.output_reduction, orient=tk.HORIZONTAL,
+                  command=lambda v: self.output_reduction_label.config(text=f"{float(v):.0f} %")).grid(
+            row=0, column=1, sticky=(tk.W, tk.E), padx=4)
+        self.output_reduction_label = ttk.Label(panel, text="50 %")
+        self.output_reduction_label.grid(row=0, column=2, sticky=tk.W)
+
+        self.run_shunt_btn = ttk.Button(panel, text="Solve Shunt Motor Case", command=self.solve_shunt_case)
+        self.run_shunt_btn.grid(row=0, column=3, padx=6)
+
+        # Economic inputs
+        ttk.Label(panel, text="Energy Cost ($/kWh):").grid(row=1, column=0, sticky=tk.W, pady=2)
+        self.energy_cost = tk.DoubleVar(value=0.12)
+        ttk.Entry(panel, textvariable=self.energy_cost, width=10).grid(row=1, column=1, sticky=tk.W)
+
+        ttk.Label(panel, text="Operating Hours/yr:").grid(row=1, column=2, sticky=tk.W, pady=2)
+        self.operating_hours = tk.DoubleVar(value=3000)
+        ttk.Entry(panel, textvariable=self.operating_hours, width=10).grid(row=1, column=3, sticky=tk.W)
+
+        ttk.Label(panel, text="Maintenance ($/yr):").grid(row=2, column=0, sticky=tk.W, pady=2)
+        self.maintenance_cost = tk.DoubleVar(value=450)
+        ttk.Entry(panel, textvariable=self.maintenance_cost, width=10).grid(row=2, column=1, sticky=tk.W)
+
+        ttk.Button(panel, text="Update Economic Analysis", command=self.update_economic_analysis).grid(
+            row=2, column=3, padx=6, pady=2)
+
+        panel.grid_columnconfigure(1, weight=1)
+        panel.grid_columnconfigure(3, weight=1)
 
     def init_plots(self):
         """Initialize empty plots"""
@@ -426,6 +586,12 @@ class MotorAnalysisTool:
         self.ax3.set_ylabel('Current (A)')
         self.ax3.set_title('Stator Current vs Time')
         self.ax3.grid(True, alpha=0.3)
+
+        # Thermal and stress plot
+        self.ax4.set_xlabel('Time (s)')
+        self.ax4.set_ylabel('Temp (°C) / Stress (MPa)')
+        self.ax4.set_title('Thermal & Mechanical Response')
+        self.ax4.grid(True, alpha=0.3)
 
         self.canvas.draw()
 
@@ -507,6 +673,55 @@ For Star-Delta Starting:
         except Exception as e:
             messagebox.showerror("Calculation Error", f"An error occurred:\n{str(e)}")
 
+    def solve_shunt_case(self):
+        """Solve the DC shunt motor example and update reports."""
+        try:
+            base_case = self.shunt_case.evaluate()
+            reduced_power = self.shunt_case.output_power_hp * 746 * (1 - self.output_reduction.get() / 100)
+            reduced_case = self.shunt_case.evaluate(output_power_watts=reduced_power)
+
+            summary = f"""
+{'='*80}
+DC SHUNT MOTOR PERFORMANCE
+{'='*80}
+Rated Output Power:      {self.shunt_case.output_power_hp:.2f} hp
+Line Voltage:            {self.shunt_case.voltage:.1f} V
+Line Current:            {self.shunt_case.line_current:.1f} A
+Rated Speed:             {self.shunt_case.speed_rpm:.1f} rpm
+
+(a) Rated Condition:
+  Input Power:           {base_case['input_power']:.2f} W
+  Total Losses:          {base_case['losses']:.2f} W
+  Efficiency:            {base_case['efficiency']*100:.2f} %
+  Back EMF:              {base_case['back_emf']:.2f} V
+
+(b) Reduced Output ({self.output_reduction.get():.0f}% decrease):
+  Output Power:          {reduced_power:.2f} W
+  Input Power:           {reduced_case['input_power']:.2f} W
+  Efficiency:            {reduced_case['efficiency']*100:.2f} %
+  Estimated Speed:       {reduced_case['speed_rpm']:.1f} rpm
+  Armature Current:      {reduced_case['armature_current']:.2f} A
+{'='*80}
+"""
+
+            self.results_text.delete(1.0, tk.END)
+            self.results_text.insert(1.0, summary)
+            self.results_notebook.select(0)
+
+            self.multiphysics_text.delete(1.0, tk.END)
+            self.multiphysics_text.insert(1.0, "Loss Breakdown (Rated):\n")
+            self.multiphysics_text.insert(tk.END, f"  Constant Losses: {self.shunt_case._constant_losses():.2f} W\n")
+            self.multiphysics_text.insert(tk.END, f"  Armature Copper Loss: {self.shunt_case._armature_copper_loss(base_case['armature_current']):.2f} W\n")
+            self.multiphysics_text.insert(tk.END, f"  Iron/Core Loss: {self.shunt_case.core_loss:.2f} W\n")
+            self.multiphysics_text.insert(tk.END, f"  Friction & Windage: {self.shunt_case.friction_loss:.2f} W\n")
+            self.multiphysics_text.insert(tk.END, f"  Stray Load Loss: {self.shunt_case.stray_loss:.2f} W\n")
+
+            self.update_economic_analysis()
+
+            messagebox.showinfo("Shunt Motor", "DC shunt motor calculations completed")
+        except Exception as exc:
+            messagebox.showerror("Error", f"Unable to solve shunt motor case:\n{exc}")
+
     def start_simulation(self):
         """Start dynamic simulation"""
         if self.motor is None:
@@ -577,8 +792,26 @@ For Star-Delta Starting:
                     'current': np.array(current)
                 }
 
+            # Multi-physics calculations
+            multiphysics = self.compute_multiphysics_data(
+                self.simulation_data['t'],
+                self.simulation_data['torque'],
+                self.simulation_data['current']
+            )
+
+            self.simulation_data.update(multiphysics)
+
+            # Update power consumption indicator
+            avg_power = np.mean(self.simulation_data['current']) * self.motor.V_rated * np.sqrt(3)
+            derate_factor = 1 - self.derating.get() / 100
+            self.power_consumption_var.set(
+                f"Power Consumption: {avg_power * derate_factor/1000:.2f} kW (derated)"
+            )
+
             # Plot results
             self.plot_simulation_results()
+            self.refresh_multiphysics_text()
+            self.update_economic_analysis()
 
             self.simulation_running = False
             self.start_btn.config(state=tk.NORMAL)
@@ -638,6 +871,97 @@ For Star-Delta Starting:
             'current': np.array(current)
         }
 
+    def compute_multiphysics_data(self, t, torque, current):
+        """Estimate coupled electromagnetic-thermal-mechanical behavior."""
+        # Simple thermal RC model
+        ambient = 25.0
+        tau = 8.0  # thermal time constant
+        k_loss = 0.12  # temperature rise per watt-s
+        temperatures = [ambient]
+
+        # Loss breakdowns (approximate)
+        copper_loss = (current ** 2) * (self.motor.R1 + self.motor.R2)
+        iron_loss = 0.015 * self.motor.P_rated * np.ones_like(current)
+        mech_loss = 0.02 * np.abs(torque)
+
+        dt = np.diff(t, prepend=t[0])
+        for i in range(1, len(t)):
+            loss_total = copper_loss[i] + iron_loss[i] + mech_loss[i]
+            dTdt = k_loss * loss_total - (temperatures[-1] - ambient) / tau
+            temperatures.append(temperatures[-1] + dTdt * dt[i])
+
+        temperatures = np.array(temperatures)
+
+        # Mechanical stress estimation (arbitrary scaling for visualization)
+        stress = 0.01 * np.abs(torque)  # MPa equivalent
+
+        # Loss detail for reporting
+        loss_breakdown = {
+            'copper': float(np.mean(copper_loss)),
+            'iron': float(np.mean(iron_loss)),
+            'mechanical': float(np.mean(mech_loss))
+        }
+
+        return {
+            'temperature': temperatures,
+            'stress': stress,
+            'loss_breakdown': loss_breakdown
+        }
+
+    def refresh_multiphysics_text(self):
+        """Update multi-physics tab with latest simulation insights."""
+        if self.simulation_data is None:
+            return
+
+        self.multiphysics_text.delete(1.0, tk.END)
+        temp = self.simulation_data.get('temperature', [])
+        stress = self.simulation_data.get('stress', [])
+        losses = self.simulation_data.get('loss_breakdown', {})
+
+        if len(temp) > 0:
+            self.multiphysics_text.insert(tk.END, f"Peak Temperature: {np.max(temp):.2f} °C\n")
+            self.multiphysics_text.insert(tk.END, f"Average Temperature: {np.mean(temp):.2f} °C\n")
+
+        if len(stress) > 0:
+            self.multiphysics_text.insert(tk.END, f"Peak Shaft Stress (eq): {np.max(stress):.2f} MPa\n")
+
+        if losses:
+            self.multiphysics_text.insert(tk.END, "Loss Breakdown (avg):\n")
+            for k, v in losses.items():
+                self.multiphysics_text.insert(tk.END, f"  {k.capitalize():<12}: {v:.2f} W\n")
+
+        self.multiphysics_text.insert(tk.END, "\nCoupled electromagnetic-thermal model tracks temperature rise\n"
+                                          "while mechanical stress estimation monitors shaft loading."
+                                          " Use derating slider to keep temperatures below limits.")
+
+    def update_economic_analysis(self):
+        """Update economic analysis tab based on latest data."""
+        try:
+            if self.simulation_data is not None and 'current' in self.simulation_data:
+                avg_current = np.mean(self.simulation_data['current'])
+                avg_power_kw = avg_current * self.motor.V_rated * np.sqrt(3) / 1000
+            else:
+                avg_power_kw = self.shunt_case.voltage * self.shunt_case.line_current / 1000
+
+            annual_energy = avg_power_kw * self.operating_hours.get()
+            energy_cost = annual_energy * self.energy_cost.get()
+            total_cost = energy_cost + self.maintenance_cost.get()
+
+            self.economic_text.delete(1.0, tk.END)
+            self.economic_text.insert(1.0, f"Average Demand: {avg_power_kw:.2f} kW\n")
+            self.economic_text.insert(tk.END, f"Annual Energy: {annual_energy:.1f} kWh\n")
+            self.economic_text.insert(tk.END, f"Energy Cost: ${energy_cost:,.2f}\n")
+            self.economic_text.insert(tk.END, f"Maintenance: ${self.maintenance_cost.get():,.2f}\n")
+            self.economic_text.insert(tk.END, f"Total Annual Cost: ${total_cost:,.2f}\n")
+
+            if self.simulation_data is not None and 'loss_breakdown' in self.simulation_data:
+                losses = self.simulation_data['loss_breakdown']
+                self.economic_text.insert(tk.END, "\nLoss Breakdown for Efficiency Tuning:\n")
+                for k, v in losses.items():
+                    self.economic_text.insert(tk.END, f"  {k.capitalize():<12}: {v:.2f} W\n")
+        except Exception as exc:
+            messagebox.showwarning("Economic Analysis", f"Unable to update economics: {exc}")
+
     def plot_simulation_results(self):
         """Plot simulation results"""
         if self.simulation_data is None:
@@ -647,6 +971,7 @@ For Star-Delta Starting:
         self.ax1.clear()
         self.ax2.clear()
         self.ax3.clear()
+        self.ax4.clear()
 
         # Plot speed
         self.ax1.plot(self.simulation_data['t'], self.simulation_data['speed'],
@@ -680,6 +1005,19 @@ For Star-Delta Starting:
         self.ax3.set_title('Stator Current vs Time', fontsize=11, fontweight='bold')
         self.ax3.grid(True, alpha=0.3)
         self.ax3.legend(loc='best', fontsize=9)
+
+        # Plot thermal and mechanical response
+        self.ax4.plot(self.simulation_data['t'], self.simulation_data.get('temperature', []),
+                      color='orange', linewidth=2, label='Winding Temp')
+        self.ax4.plot(self.simulation_data['t'], self.simulation_data.get('stress', []),
+                      color='purple', linewidth=2, linestyle='--', label='Shaft Stress (MPa eq)')
+        self.ax4.axhline(y=self.thermal_limit.get(), color='red', linestyle=':',
+                         label='Thermal Limit')
+        self.ax4.set_xlabel('Time (s)', fontsize=10)
+        self.ax4.set_ylabel('Temp / Stress', fontsize=10)
+        self.ax4.set_title('Coupled Thermal & Mechanical Response', fontsize=11, fontweight='bold')
+        self.ax4.grid(True, alpha=0.3)
+        self.ax4.legend(loc='best', fontsize=9)
 
         # Mark star-delta transition if applicable
         if self.starting_method_var.get() == 'Star-Delta':
@@ -742,8 +1080,9 @@ Features:
 • Starting torque calculations (DOL & Star-Delta)
 • Dynamic motor simulation with multiple ODE solvers
 • Real-time visualization of speed, torque, and current
-• Professional GUI with auto-scaling
-• Comprehensive motor modeling
+• Professional GUI with auto-scaling and tabbed results
+• Comprehensive motor modeling, economics, and multi-physics views
+• DC shunt motor efficiency calculator for quick case studies
 
 This tool is designed for educational and practical use
 in electrical engineering applications.

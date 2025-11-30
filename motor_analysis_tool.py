@@ -642,8 +642,29 @@ class MotorAnalysisTool:
         dc_tab = ttk.Frame(self.results_notebook)
         self.results_notebook.add(dc_tab, text="DC Motor Lab / Advanced")
 
+        # Scrollable container keeps controls visible on smaller screens while still
+        # allowing plots/results to grow.
+        dc_tab.grid_columnconfigure(0, weight=1)
+        dc_tab.grid_rowconfigure(0, weight=1)
+        scroll_canvas = tk.Canvas(dc_tab, highlightthickness=0)
+        scroll_canvas.grid(row=0, column=0, sticky=(tk.N, tk.S, tk.E, tk.W))
+        dc_scrollbar = ttk.Scrollbar(dc_tab, orient=tk.VERTICAL, command=scroll_canvas.yview)
+        dc_scrollbar.grid(row=0, column=1, sticky=(tk.N, tk.S))
+        scroll_canvas.configure(yscrollcommand=dc_scrollbar.set)
+
+        scroll_frame = ttk.Frame(scroll_canvas)
+        canvas_window = scroll_canvas.create_window((0, 0), window=scroll_frame, anchor="nw")
+        scroll_frame.bind(
+            "<Configure>",
+            lambda e: scroll_canvas.configure(scrollregion=scroll_canvas.bbox("all"))
+        )
+        scroll_canvas.bind(
+            "<Configure>",
+            lambda e: scroll_canvas.itemconfig(canvas_window, width=e.width)
+        )
+
         # Input area
-        input_frame = ttk.LabelFrame(dc_tab, text="Lab Inputs", padding="8")
+        input_frame = ttk.LabelFrame(scroll_frame, text="Lab Inputs", padding="8")
         input_frame.grid(row=0, column=0, sticky=(tk.W, tk.E))
 
         labels = [
@@ -673,14 +694,14 @@ class MotorAnalysisTool:
         ttk.Combobox(input_frame, textvariable=self.dc_solver, values=["RK45", "RK23", "Euler"], state="readonly", width=10).grid(row=6, column=1, sticky=(tk.W, tk.E), padx=4, pady=2)
 
         # Control buttons
-        btn_frame = ttk.Frame(dc_tab)
+        btn_frame = ttk.LabelFrame(scroll_frame, text="Lab Controls", padding="6")
         btn_frame.grid(row=1, column=0, sticky=(tk.W, tk.E), pady=6)
         ttk.Button(btn_frame, text="Start DC Analysis", command=self.run_dc_analysis).pack(side=tk.LEFT, padx=4)
         ttk.Button(btn_frame, text="Run Dynamic Lab", command=self.simulate_dc_dynamics).pack(side=tk.LEFT, padx=4)
         ttk.Button(btn_frame, text="Reset", command=self.reset_dc_lab).pack(side=tk.LEFT, padx=4)
 
         # Results and visualization
-        dc_results_frame = ttk.Frame(dc_tab)
+        dc_results_frame = ttk.Frame(scroll_frame)
         dc_results_frame.grid(row=2, column=0, sticky=(tk.W, tk.E), padx=4, pady=4)
         dc_scroll = ttk.Scrollbar(dc_results_frame, orient=tk.VERTICAL)
         self.dc_results_text = tk.Text(dc_results_frame, height=10, width=90, font=("Courier", 10),
@@ -689,7 +710,7 @@ class MotorAnalysisTool:
         self.dc_results_text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         dc_scroll.pack(side=tk.RIGHT, fill=tk.Y)
 
-        plot_frame = ttk.LabelFrame(dc_tab, text="Dynamic Visualization", padding="6")
+        plot_frame = ttk.LabelFrame(scroll_frame, text="Dynamic Visualization", padding="6")
         plot_frame.grid(row=3, column=0, sticky=(tk.W, tk.E, tk.N, tk.S), padx=4, pady=4)
         plot_frame.grid_columnconfigure(0, weight=1)
         plot_frame.grid_rowconfigure(0, weight=1)
@@ -703,8 +724,8 @@ class MotorAnalysisTool:
         self.dc_canvas.draw()
         self.dc_canvas.get_tk_widget().grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
 
-        dc_tab.grid_columnconfigure(0, weight=1)
-        dc_tab.grid_rowconfigure(3, weight=1)
+        scroll_frame.grid_columnconfigure(0, weight=1)
+        scroll_frame.grid_rowconfigure(3, weight=1)
 
     def init_plots(self):
         """Initialize empty plots"""
@@ -864,8 +885,13 @@ Rated Speed:             {self.shunt_case.speed_rpm:.1f} rpm
     def start_simulation(self):
         """Start dynamic simulation"""
         if self.motor is None:
-            messagebox.showwarning("Warning", "Please calculate starting torque first!")
-            return
+            # Auto-build the induction motor model from current inputs so the
+            # start/stop controls always work without hunting for another button.
+            try:
+                self.calculate_starting_torque()
+            except Exception:
+                messagebox.showwarning("Warning", "Unable to initialize motor parameters. Check inputs then retry.")
+                return
 
         try:
             self.simulation_running = True
